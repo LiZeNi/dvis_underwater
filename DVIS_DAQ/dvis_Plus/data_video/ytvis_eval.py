@@ -90,13 +90,190 @@ class YTVISEvaluator(DatasetEvaluator):
 
         self._metadata = MetadataCatalog.get(dataset_name)
 
-        json_file = PathManager.get_local_path(self._metadata.json_file)
-        with contextlib.redirect_stdout(io.StringIO()):
-            self._ytvis_api = YTVOS(json_file)
+        # ===== 🔧 修改：支持分散的 JSON 文件 =====
+        json_file = self._metadata.get("json_file", None)
+        
+        if json_file is None or not os.path.exists(PathManager.get_local_path(json_file)):
+            # 如果没有合并的 JSON 文件，从分散的 JSON 创建
+            self._logger.info(f"📝 No merged JSON file found, loading from scattered annotations...")
+            self._ytvis_api = self._load_scattered_annotations()
+        else:
+            # 使用合并的 JSON 文件
+            json_file = PathManager.get_local_path(json_file)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self._ytvis_api = YTVOS(json_file)
 
         # Test set json files do not contain annotations (evaluation must be
         # performed using the COCO evaluation server).
         self._do_evaluation = "annotations" in self._ytvis_api.dataset
+
+    def _load_scattered_annotations(self):
+        """
+        从分散的 JSON 文件加载标注并创建 YTVOS 对象
+        (最终修正版：支持损坏/空 JSON，使用占位符保证 ID 绝对对齐)
+        """
+        annotation_dir = self._metadata.get("annotation_dir", None)
+        
+        if annotation_dir is None:
+            raise ValueError("Metadata must contain 'annotation_dir'.")
+        
+        annotation_dir = PathManager.get_local_path(annotation_dir)
+        # 必须排序，确保和 DataLoader 读取顺序一致
+        json_files = sorted(Path(annotation_dir).glob("*.json"))
+        
+        if len(json_files) == 0:
+            raise ValueError(f"No JSON files found in {annotation_dir}")
+        
+        self._logger.info(f"🔄 Loading {len(json_files)} scattered JSON files from {annotation_dir}")
+        
+        # 获取类别信息 (逻辑不变)
+        categories = self._metadata.get("thing_classes", None)
+        if categories is None:
+            # 尝试从第一个文件获取，如果失败则使用默认
+            try:
+                with open(json_files[0], 'r') as f:
+                    sample_data = json.load(f)
+                categories = sample_data.get("categories", [{"id": 1, "name": "object"}])
+            except:
+                categories = [{"id": 1, "name": "object"}]
+        else:
+            categories = [{"id": i + 1, "name": name, "supercategory": "object"} for i, name in enumerate(categories)]
+        
+        merged_data = {
+            "info": {"description": "Merged Dataset", "version": "1.0"},
+            "categories": categories,
+            "videos": [],
+            "annotations": []
+        }
+        
+        video_id = 0
+        ann_id = 0
+        
+        for json_file in json_files:
+            video_name = json_file.stem
+            
+            # 1. 尝试读取文件
+            coco_data = {}
+            load_success = False
+            try:
+                with open(json_file, 'r') as f:
+                    coco_data = json.load(f)
+                load_success = True
+            except Exception as e:
+                self._logger.warning(f"⚠️  File broken {json_file}: {e}. Using dummy placeholder.")
+                load_success = False
+
+            # 2. 尝试解析图像信息
+            has_valid_images = False
+            if load_success and "images" in coco_data and isinstance(coco_data["images"], list) and len(coco_data["images"]) > 0:
+                has_valid_images = True
+
+            # 3. 构建视频信息 (关键步骤)
+            if has_valid_images:
+                # === 情况 A: 有效文件 ===
+                images_dict = {img["id"]: img for img in coco_data["images"]}
+                sorted_images = sorted(images_dict.items(), key=lambda x: x[1]["file_name"])
+                first_img = sorted_images[0][1]
+                
+                width = first_img.get("width", 1920) # 防止 width 缺失
+                height = first_img.get("height", 1080)
+                length = len(sorted_images)
+                
+                # 准备标注处理所需的映射
+                frame_idx_map = {img_id: idx for idx, (img_id, _) in enumerate(sorted_images)}
+                
+            else:
+                # === 情况 B: 无效/空/无图文件 ===
+                # 创建一个“假”视频信息进行占位
+                # 只要 ID 占住了，Evaluator 就不会报错，只是这个视频没有 GT 也就是了
+                self._logger.info(f"⚠️  {video_name} has no images/invalid. Creating dummy entry.")
+                width = 100  # 随意设置，不影响
+                height = 100
+                length = 0   # 长度为 0
+                frame_idx_map = {} # 空映射
+
+            # 无论有效无效，都要注册视频！
+            video_record = {
+                "id": video_id,  # 【核心】保持 ID 连续自增
+                "name": video_name,
+                "width": width,
+                "height": height,
+                "length": length
+            }
+            merged_data["videos"].append(video_record)
+
+            # 4. 处理标注 (仅当文件有效且有标注时)
+            if has_valid_images and "annotations" in coco_data and len(coco_data["annotations"]) > 0:
+                track_anns = defaultdict(lambda: {
+                    "segmentations": [None] * length,
+                    "bboxes": [None] * length,
+                    "areas": [None] * length,
+                    "category_id": None
+                })
+                
+                for ann in coco_data["annotations"]:
+                    # 鲁棒性获取字段
+                    track_id = ann.get("track_id", ann.get("id"))
+                    img_id = ann.get("image_id")
+                    
+                    if img_id not in frame_idx_map:
+                        continue
+                        
+                    frame_idx = frame_idx_map[img_id]
+                    
+                    # 填充数据
+                    segm = ann.get("segmentation")
+                    if segm:
+                        if isinstance(segm, dict):
+                            track_anns[track_id]["segmentations"][frame_idx] = segm
+                        elif isinstance(segm, list) and len(segm) > 0:
+                            track_anns[track_id]["segmentations"][frame_idx] = segm
+                    
+                    bbox = ann.get("bbox")
+                    if bbox and len(bbox) == 4:
+                        track_anns[track_id]["bboxes"][frame_idx] = bbox
+                    
+                    area = ann.get("area", 0)
+                    track_anns[track_id]["areas"][frame_idx] = area
+                    
+                    if track_anns[track_id]["category_id"] is None:
+                        track_anns[track_id]["category_id"] = ann.get("category_id", 1)
+                
+                # 写入标注
+                for track_id, track_data in track_anns.items():
+                    ann_record = {
+                        "id": ann_id,
+                        "video_id": video_id,
+                        "category_id": track_data["category_id"],
+                        "segmentations": track_data["segmentations"],
+                        "bboxes": track_data["bboxes"],
+                        "areas": track_data["areas"],
+                        "iscrowd": 0
+                    }
+                    merged_data["annotations"].append(ann_record)
+                    ann_id += 1
+
+            # 5. 【核心】ID 必须自增
+            video_id += 1
+            
+        self._logger.info(f"✅ Total: {len(merged_data['videos'])} videos (including dummies), {len(merged_data['annotations'])} annotations")
+        
+        # ... (后续生成临时文件代码不变) ...
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump(merged_data, f)
+            temp_json = f.name
+            
+        with contextlib.redirect_stdout(io.StringIO()):
+            ytvis_api = YTVOS(temp_json)
+            
+        try:
+            os.unlink(temp_json)
+        except:
+            pass
+            
+        return ytvis_api
+
 
     def reset(self):
         self._predictions = []

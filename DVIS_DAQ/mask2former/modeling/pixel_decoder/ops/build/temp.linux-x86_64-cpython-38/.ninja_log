@@ -1,0 +1,7 @@
+# ninja log v5
+0	3709	1764758301149076955	/home/zlni/zlni/DVIS_Plus/DVIS_DAQ/mask2former/modeling/pixel_decoder/ops/build/temp.linux-x86_64-cpython-38/home/zlni/zlni/DVIS_Plus/DVIS_DAQ/mask2former/modeling/pixel_decoder/ops/src/cpu/ms_deform_attn_cpu.o	53616c4a405ad084
+0	10847	1764758308213100075	/home/zlni/zlni/DVIS_Plus/DVIS_DAQ/mask2former/modeling/pixel_decoder/ops/build/temp.linux-x86_64-cpython-38/home/zlni/zlni/DVIS_Plus/DVIS_DAQ/mask2former/modeling/pixel_decoder/ops/src/cuda/ms_deform_attn_cuda.o	dda375361f14753a
+0	20750	1764758318177132610	/home/zlni/zlni/DVIS_Plus/DVIS_DAQ/mask2former/modeling/pixel_decoder/ops/build/temp.linux-x86_64-cpython-38/home/zlni/zlni/DVIS_Plus/DVIS_DAQ/mask2former/modeling/pixel_decoder/ops/src/vision.o	70db487b378aac41
+0	2724	1767277582263326931	/home/zlni/zlni/DVIS_Plus/DVIS_DAQ/mask2former/modeling/pixel_decoder/ops/build/temp.linux-x86_64-cpython-38/home/zlni/zlni/DVIS_Plus/DVIS_DAQ/mask2former/modeling/pixel_decoder/ops/src/cpu/ms_deform_attn_cpu.o	adbb26caafc54032
+0	10325	1767277589855477641	/home/zlni/zlni/DVIS_Plus/DVIS_DAQ/mask2former/modeling/pixel_decoder/ops/build/temp.linux-x86_64-cpython-38/home/zlni/zlni/DVIS_Plus/DVIS_DAQ/mask2former/modeling/pixel_decoder/ops/src/cuda/ms_deform_attn_cuda.o	b2dd333dec3dd6b0
+0	17264	1767277596791615219	/home/zlni/zlni/DVIS_Plus/DVIS_DAQ/mask2former/modeling/pixel_decoder/ops/build/temp.linux-x86_64-cpython-38/home/zlni/zlni/DVIS_Plus/DVIS_DAQ/mask2former/modeling/pixel_decoder/ops/src/vision.o	153d28430734cdad

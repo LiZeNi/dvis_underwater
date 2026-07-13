@@ -370,7 +370,7 @@ class MinVIS(nn.Module):
             scores_per_image, topk_indices = scores.flatten(0, 1).topk(10, sorted=False)
             labels_per_image = labels[topk_indices]
             topk_indices = topk_indices // self.sem_seg_head.num_classes
-            pred_masks = pred_masks[topk_indices]
+            pred_masks = pred_masks[topk_indices.to(pred_masks.device)]
 
             pred_masks = F.interpolate(
                 pred_masks, size=first_resize_size, mode="bilinear", align_corners=False
