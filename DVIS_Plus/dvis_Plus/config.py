@@ -77,4 +77,14 @@ def add_ctvis_config(cfg):
     cfg.MODEL.MASK_FORMER.REID_HIDDEN_DIM = 256
     cfg.MODEL.MASK_FORMER.NUM_REID_HEAD_LAYERS = 3
 
-
+def add_sam2_hiera_config(cfg):
+    """添加 SAM 2 Hiera 骨干网络的专属配置"""
+    cfg.MODEL.SAM2_HIERA = CN()
+    # 设定默认值为 Tiny 版本的参数，如果 YAML 不写就默认用这个
+    cfg.MODEL.SAM2_HIERA.EMBED_DIM = 96
+    cfg.MODEL.SAM2_HIERA.NUM_HEADS = 1
+    cfg.MODEL.SAM2_HIERA.STAGES = [1, 2, 7, 2]
+    cfg.MODEL.SAM2_HIERA.GLOBAL_ATT_BLOCKS = [5, 7, 9]
+    cfg.MODEL.SAM2_HIERA.WINDOW_SPEC = [8, 4, 14, 7]
+    cfg.MODEL.SAM2_HIERA.DROP_PATH_RATE = 0.1
+    cfg.MODEL.SAM2_HIERA.CHANNEL_LIST = [96, 192, 384, 768]

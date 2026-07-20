@@ -1,5 +1,5 @@
 # config
-from .config import add_minvis_config, add_dvis_config, add_ctvis_config
+from .config import add_minvis_config, add_dvis_config, add_ctvis_config, add_sam2_hiera_config
 
 from .video_mask2former_transformer_decoder import\
     VideoMultiScaleMaskedTransformerDecoder_minvis,\

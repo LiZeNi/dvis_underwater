@@ -2,7 +2,6 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 from detectron2.config import CfgNode as CN
 
-
 def add_maskformer2_config(cfg):
     """
     Add config for MASK_FORMER.
@@ -121,3 +120,15 @@ def add_maskformer2_config(cfg):
     # Importance sampling parameter for PointRend point sampling during training. Parametr `beta` in
     # the original paper.
     cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO = 0.75
+
+
+def add_sam2_hiera_config(cfg):
+    """添加 SAM 2 Hiera 骨干网络的专属配置"""
+    cfg.MODEL.SAM2_HIERA = CN()
+    # 设定默认值为 Tiny 版本的参数，如果 YAML 不写就默认用这个
+    cfg.MODEL.SAM2_HIERA.EMBED_DIM = 96
+    cfg.MODEL.SAM2_HIERA.NUM_HEADS = 1
+    cfg.MODEL.SAM2_HIERA.STAGES = [1, 2, 7, 2]
+    cfg.MODEL.SAM2_HIERA.GLOBAL_ATT_BLOCKS = [5, 7, 9]
+    cfg.MODEL.SAM2_HIERA.WINDOW_SPEC = [8, 4, 14, 7]
+    cfg.MODEL.SAM2_HIERA.DROP_PATH_RATE = 0.1

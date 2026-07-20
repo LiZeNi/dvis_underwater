@@ -9,15 +9,14 @@ MODEL:
     NOISE_RATIO: 0.5
 
 SOLVER:
-  IMS_PER_BATCH: 4 #8
-  BASE_LR: 0.0001
-  IMS_PER_BATCH: 8
+  IMS_PER_BATCH: 2 #8
+  BASE_LR: 0.00005  #0.0001
   STEPS: (28000,)
   MAX_ITER: 40000
   CHECKPOINT_PERIOD: 4000
 
 INPUT:
   SAMPLING_FRAME_NUM: 5
-  SAMPLING_FRAME_RANGE: 2
+  SAMPLING_FRAME_RANGE: 8
 
-OUTPUT_DIR: '/home/zlni/zlni/data/UMOT_weight/dvis++/DVIS_Plus_Online_R50_OVIS'
+OUTPUT_DIR: '/data/xyjiang/zlni/zlni/data/UMOT_weight/dvis++/DVIS_Plus_Online_R50_OVIS'

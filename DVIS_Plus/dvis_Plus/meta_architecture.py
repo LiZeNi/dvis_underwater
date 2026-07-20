@@ -1,10 +1,13 @@
 from typing import Tuple
 import einops
-
+import pycocotools.mask as mask_util
 import torch
 from torch import nn
 from torch.nn import functional as F
-
+import gc
+import os
+import psutil
+import numpy as np
 from detectron2.config import configurable
 from detectron2.data import MetadataCatalog
 from detectron2.modeling import META_ARCH_REGISTRY, build_backbone, build_sem_seg_head
@@ -19,6 +22,17 @@ from scipy.optimize import linear_sum_assignment
 from .tracker import ReferringTracker_noiser
 from .refiner import TemporalRefiner
 from .utils import loss_reid, Outputs_Memory_PerClasses
+
+# 🌟 内存监控探针
+def print_mem(prefix=""):
+    process = psutil.Process(os.getpid())
+    cpu_mem = process.memory_info().rss / 1024 / 1024 / 1024  # GB
+    if torch.cuda.is_available():
+        gpu_mem = torch.cuda.memory_allocated() / 1024 / 1024 / 1024  # GB
+        gpu_max = torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024
+        print(f"[{prefix}] | CPU RAM: {cpu_mem:.2f} GB | GPU VRAM: {gpu_mem:.2f} GB (Max: {gpu_max:.2f} GB)")
+    else:
+        print(f"[{prefix}] | CPU RAM: {cpu_mem:.2f} GB")
 
 @META_ARCH_REGISTRY.register()
 class MinVIS(nn.Module):
@@ -381,11 +395,30 @@ class MinVIS(nn.Module):
                 pred_masks, size=(output_height, output_width), mode="bilinear", align_corners=False
             )
 
-            masks = pred_masks > 0.
-
             out_scores = scores_per_image.tolist()
             out_labels = labels_per_image.tolist()
-            out_masks = [m for m in masks.cpu()]
+
+            N_objs, T_frames, H, W = pred_masks.shape
+
+            out_masks = [[] for _ in range(N_objs)]
+
+            for t in range(T_frames):
+                for i in range(N_objs):
+                    single_mask = (pred_masks[i, t] > 0.0).cpu().numpy().astype(np.uint8)
+
+                    rle = mask_util.encode(np.asfortranarray(single_mask[:, :, np.newaxis]))[0]
+                    rle["counts"] = rle["counts"].decode("utf-8")
+
+                    out_masks[i].append(rle)
+
+                    del single_mask
+
+                if t % 50 == 0:
+                    gc.collect()
+
+            del pred_masks
+            torch.cuda.empty_cache()
+            gc.collect()
         else:
             out_scores = []
             out_labels = []
@@ -634,9 +667,15 @@ class DVIS_Plus_online(MinVIS):
         images = []
         for video in batched_inputs:
             for frame in video["image"]:
-                images.append(frame.to(self.device))
-        images = [(x - self.pixel_mean) / self.pixel_std for x in images]
+                images.append(frame)
+                
+        pixel_mean = self.pixel_mean
+        pixel_std = self.pixel_std
+        images = [(x - pixel_mean) / pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
+
+        num_frames = len(images.tensor)
+
 
         if not self.training and self.window_inference:
             outputs = self.run_window_inference(images.tensor, window_size=self.window_size)
@@ -700,6 +739,10 @@ class DVIS_Plus_online(MinVIS):
 
             height = input_per_image.get("height", image_size[0])  # raw image size before data augmentation
             width = input_per_image.get("width", image_size[1])
+
+            del images, input_per_image
+            gc.collect()
+            torch.cuda.empty_cache()
 
             return retry_if_cuda_oom(self.inference_video_task)(
                 mask_cls_result, mask_pred_result, image_size, height, width, first_resize_size, pred_id
@@ -776,6 +819,7 @@ class DVIS_Plus_online(MinVIS):
         if len(images_tensor) % window_size != 0:
             iters += 1
         out_list = []
+
         for i in range(iters):
             start_idx = i * window_size
             end_idx = (i+1) * window_size
@@ -807,11 +851,16 @@ class DVIS_Plus_online(MinVIS):
             # track_out['pred_embds'] = track_out['pred_embds'].detach()
             out_list.append(track_out)
 
+            del frame_embds, frame_embds_no_norm, out
+            gc.collect()
+            torch.cuda.empty_cache()
+
         # merge outputs
         outputs = {}
         outputs['pred_logits'] = torch.cat([x['pred_logits'] for x in out_list], dim=1)
         outputs['pred_masks'] = torch.cat([x['pred_masks'] for x in out_list], dim=2)
         outputs['pred_embds'] = torch.cat([x['pred_embds'] for x in out_list], dim=2)
+        
 
         return outputs
 
@@ -827,6 +876,7 @@ class DVIS_Plus_online(MinVIS):
             labels = torch.arange(
                 self.sem_seg_head.num_classes, device=self.device
             ).unsqueeze(0).repeat(self.num_queries, 1).flatten(0, 1)
+            max_n = min(self.max_num, scores.shape[0])
             # keep top-K predictions
             scores_per_image, topk_indices = scores.flatten(0, 1).topk(self.max_num, sorted=False)
             labels_per_image = labels[topk_indices]
@@ -835,20 +885,31 @@ class DVIS_Plus_online(MinVIS):
             pred_ids = pred_id[topk_indices]
 
             # interpolation to original image size
-            pred_masks = F.interpolate(
-                pred_masks, size=first_resize_size, mode="bilinear", align_corners=False
-            )
-            pred_masks = pred_masks[:, :, : img_size[0], : img_size[1]]
-            pred_masks = F.interpolate(
-                pred_masks, size=(output_height, output_width), mode="bilinear", align_corners=False
-            )
-            masks = pred_masks > 0.
-            del pred_masks
+            K, T, H, W = pred_masks.shape
+            out_masks = []
+              
+            if pred_masks.device != torch.device('cpu'):
+                pred_masks = pred_masks.cpu()
+
+            for i in range(K):
+                rles = []
+                for t in range(T):
+                    mask_i_t = pred_masks[i:i+1, t:t+1].float().to(self.device)
+                    mask_i_t = F.interpolate(mask_i_t, size=first_resize_size, mode="bilinear", align_corners=False)
+                    mask_i_t = mask_i_t[:, :, : img_size[0], : img_size[1]]
+                    mask_i_t = F.interpolate(mask_i_t, size=(output_height, output_width), mode="bilinear", align_corners=False)
+                    mask_i_t = (mask_i_t[0, 0] > 0.).cpu().numpy().astype(np.uint8)
+                      
+                    rle = mask_util.encode(np.array(mask_i_t[:, :, None], order="F", dtype="uint8"))[0]
+                    rle["counts"] = rle["counts"].decode("utf-8")
+                    rles.append(rle)
+                  
+                out_masks.append(rles)
 
             out_scores = scores_per_image.tolist()
             out_labels = labels_per_image.tolist()
             out_ids = pred_ids.tolist()
-            out_masks = [m for m in masks.cpu()]
+            del pred_masks
         else:
             out_scores = []
             out_labels = []
@@ -863,7 +924,9 @@ class DVIS_Plus_online(MinVIS):
             "pred_ids": out_ids,
             "task": "vis",
         }
-
+        gc.collect()
+        torch.cuda.empty_cache()
+        
         return video_output
 
     def inference_video_vps(

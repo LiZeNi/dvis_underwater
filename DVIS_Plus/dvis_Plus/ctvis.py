@@ -1,7 +1,8 @@
 import logging
 from typing import Tuple
 import einops
-
+import pycocotools.mask as mask_util
+import psutil
 from detectron2.data import MetadataCatalog
 from detectron2.modeling import META_ARCH_REGISTRY, build_backbone, build_sem_seg_head
 from detectron2.modeling.backbone import Backbone
@@ -13,7 +14,8 @@ from mask2former.modeling.matcher import HungarianMatcher
 from mask2former_video.utils.memory import retry_if_cuda_oom
 from scipy.optimize import linear_sum_assignment
 import random
-
+import os
+import gc
 import numpy as np
 import torch
 from torch import nn
@@ -26,6 +28,17 @@ from detectron2.utils.registry import Registry
 
 
 logger = logging.getLogger(__name__)
+
+# 🌟 内存监控探针
+def print_mem(prefix=""):
+    process = psutil.Process(os.getpid())
+    cpu_mem = process.memory_info().rss / 1024 / 1024 / 1024  # GB
+    if torch.cuda.is_available():
+        gpu_mem = torch.cuda.memory_allocated() / 1024 / 1024 / 1024  # GB
+        gpu_max = torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024
+        print(f"[{prefix}] | CPU RAM: {cpu_mem:.2f} GB | GPU VRAM: {gpu_mem:.2f} GB (Max: {gpu_max:.2f} GB)")
+    else:
+        print(f"[{prefix}] | CPU RAM: {cpu_mem:.2f} GB")
 
 @META_ARCH_REGISTRY.register()
 class CTMinVIS(nn.Module):
@@ -220,6 +233,8 @@ class CTMinVIS(nn.Module):
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
 
+        num_frames = len(images.tensor)
+
         if not self.training and self.window_inference:
             outputs = self.run_window_inference(images.tensor, window_size=3)
         else:
@@ -357,6 +372,9 @@ class CTMinVIS(nn.Module):
             out['pred_masks'] = out['pred_masks'].detach().cpu().to(torch.float32)
             out_list.append(out)
 
+            del out
+            gc.collect()
+            torch.cuda.empty_cache()
         # merge outputs
         outputs = {}
         outputs['pred_logits'] = torch.cat([x['pred_logits'] for x in out_list], dim=1).to(torch.float32).detach().cpu()
@@ -413,20 +431,30 @@ class CTMinVIS(nn.Module):
             topk_indices = topk_indices // self.sem_seg_head.num_classes
             pred_masks = pred_masks[topk_indices]
 
-            pred_masks = F.interpolate(
-                pred_masks, size=first_resize_size, mode="bilinear", align_corners=False
-            )
+            K, T, H, W = pred_masks.shape
+            out_masks = []
+              
+            if pred_masks.device != torch.device('cpu'):
+                pred_masks = pred_masks.cpu()
 
-            pred_masks = pred_masks[:, :, : img_size[0], : img_size[1]]
-            pred_masks = F.interpolate(
-                pred_masks, size=(output_height, output_width), mode="bilinear", align_corners=False
-            )
-
-            masks = pred_masks > 0.
+            for i in range(K):
+                rles = []
+                for t in range(T):
+                    mask_i_t = pred_masks[i:i+1, t:t+1].float().to(self.device)
+                    mask_i_t = F.interpolate(mask_i_t, size=first_resize_size, mode="bilinear", align_corners=False)
+                    mask_i_t = mask_i_t[:, :, : img_size[0], : img_size[1]]
+                    mask_i_t = F.interpolate(mask_i_t, size=(output_height, output_width), mode="bilinear", align_corners=False)
+                    mask_i_t = (mask_i_t[0, 0] > 0.).cpu().numpy().astype(np.uint8)
+                      
+                    rle = mask_util.encode(np.array(mask_i_t[:, :, None], order="F", dtype="uint8"))[0]
+                    rle["counts"] = rle["counts"].decode("utf-8")
+                    rles.append(rle)
+                  
+                out_masks.append(rles)
 
             out_scores = scores_per_image.tolist()
             out_labels = labels_per_image.tolist()
-            out_masks = [m for m in masks.cpu()]
+            del pred_masks
         else:
             out_scores = []
             out_labels = []

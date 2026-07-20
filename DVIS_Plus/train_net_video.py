@@ -56,10 +56,21 @@ from dvis_Plus import (
     add_minvis_config,
     add_dvis_config,
     add_ctvis_config,
+    add_sam2_hiera_config,
     build_combined_loader,
     build_detection_train_loader,
     build_detection_test_loader,
 )
+
+import sys
+sys.path.append("/data/xyjiang/zlni/zlni/DVIS_Plus/DVIS_Plus")
+from research.modeling.backbone.sam2_hiera import SAM2HieraBackbone
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+import research.modeling.sam2_meta_architecture
+import research.modeling.sam2_CTMinVIS
 
 class Trainer(DefaultTrainer):
     """
@@ -171,6 +182,8 @@ class Trainer(DefaultTrainer):
                 hyperparams = copy.copy(defaults)
                 if "backbone" in module_name:
                     hyperparams["lr"] = hyperparams["lr"] * cfg.SOLVER.BACKBONE_MULTIPLIER
+                if "align_res" in module_name:
+                    hyperparams["lr"] = hyperparams["lr"] * 10.0 
                 if (
                     "relative_position_bias_table" in module_param_name
                     or "absolute_pos_embed" in module_param_name
@@ -285,6 +298,7 @@ def setup(args):
     add_minvis_config(cfg)
     add_dvis_config(cfg)
     add_ctvis_config(cfg)
+    add_sam2_hiera_config(cfg)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
     cfg.freeze()
