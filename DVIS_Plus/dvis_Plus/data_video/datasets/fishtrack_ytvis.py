@@ -99,7 +99,7 @@ def _get_fishtrack_instances_meta():
 # 2. 核心加载函数 (保持原样，微调日志)
 # ============================================================================
 
-def load_ytvis_json(json_file, image_root, dataset_name=None, extra_annotation_keys=None):
+def load_ytvis_json(json_file, image_root, dataset_name=None, extra_annotation_keys=None, depth_root=None):
     from pycocotools.ytvos import YTVOS
 
     timer = Timer()
@@ -154,6 +154,18 @@ def load_ytvis_json(json_file, image_root, dataset_name=None, extra_annotation_k
         record["width"] = vid_dict["width"]
         record["length"] = vid_dict["length"]
         video_id = record["video_id"] = vid_dict["id"]
+
+        if depth_root is not None:
+            # 例如：原图路径 .../images/train/video_001/000001.jpg -> 深度路径 .../depth/train/video_001/000001_depth.npy
+            depth_file_names = []
+            for img_path in record["file_names"]:
+                # 从图像路径推断深度路径：替换 images 为 depth，并添加 _depth.npy
+                rel_path = os.path.relpath(img_path, image_root)
+                depth_rel_path = os.path.splitext(rel_path)[0] + "_depth.npy"
+                depth_file_names.append(os.path.join(depth_root, depth_rel_path))
+            record["depth_file_names"] = depth_file_names
+        else:
+            record["depth_file_names"] = []
 
         video_objs = []
         for frame_idx in range(record["length"]):
@@ -215,6 +227,13 @@ def register_fishtrack_ytvis_instances(name, metadata, json_file, image_root):
         json_file=json_file, image_root=image_root, evaluator_type="ytvis", **metadata
     )
 
+
+def register_fishtrack_ytvis_depth_instances(name, metadata, json_file, image_root, depth_root):
+    DatasetCatalog.register(name, lambda: load_ytvis_json(json_file, image_root, name, depth_root=depth_root))
+    MetadataCatalog.get(name).set(
+        json_file=json_file, image_root=image_root, depth_root=depth_root, evaluator_type="ytvis", **metadata
+    )
+
 # ============================================================================
 # 3. 主程序入口：注册并测试 FishTrack 数据集
 # ============================================================================
@@ -229,8 +248,8 @@ if __name__ == "__main__":
 
     # --- 配置路径 ---
     # 你的数据集根目录
-    DATASET_ROOT = "/data/xyjiang/zlni/zlni/data/fishtrack_ytvis"
-    
+    DATASET_ROOT = "/data/zlni/zlni/data/fishtrack_ytvis"
+    DEPTH_ROOT = "/data/zlni/zlni/data/fishtrack_ytvis/depth"
     # --- 注册 Train 和 Val ---
     splits = ["train", "val"]
     for split in splits:
@@ -243,3 +262,9 @@ if __name__ == "__main__":
         # 执行注册
         register_fishtrack_ytvis_instances(name, _get_fishtrack_instances_meta(), json_file, image_root)
         print(f"Successfully registered: {name}")
+        
+        # 深度数据集注册
+        name_depth = f"fishtrack_ytvis_depth_{split}"
+        depth_root = os.path.join(DEPTH_ROOT, split)   # 深度图按 split 存放
+        register_fishtrack_ytvis_depth_instances(name_depth, _get_fishtrack_instances_meta(), json_file, image_root, depth_root)
+        print(f"Successfully registered: {name_depth}")

@@ -6,7 +6,7 @@
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # Modified by Bowen Cheng from https://github.com/sukjunhwang/IFC
-
+import cv2
 import copy
 import logging
 import random
@@ -591,6 +591,136 @@ class CocoClipDatasetMapper:
                 instances.gt_masks = gt_masks
             else:
                 instances.gt_masks = torch.zeros((0, h, w), dtype=torch.uint8)
+            dataset_dict["instances"].append(instances)
+
+        return dataset_dict
+
+
+class DepthYTVISDatasetMapper(YTVISDatasetMapper):
+    """
+    支持读取深度图的 YTVIS DatasetMapper。
+    深度图路径在 dataset_dict["depth_file_names"] 中提供，
+    与 RGB 图像一一对应。
+    """
+
+    def __call__(self, dataset_dict):
+        dataset_dict = copy.deepcopy(dataset_dict)
+
+        video_length = dataset_dict["length"]
+        if self.is_train:
+            selected_idx = self.select_frames(video_length)
+            if self.sampling_frame_shuffle:
+                random.shuffle(selected_idx)
+        else:
+            selected_idx = range(video_length)
+
+        video_annos = dataset_dict.pop("annotations", None)
+        file_names = dataset_dict.pop("file_names", None)
+        depth_file_names = dataset_dict.pop("depth_file_names", None)
+
+        if self.is_train:
+            _ids = set()
+            for frame_idx in selected_idx:
+                _ids.update([anno["id"] for anno in video_annos[frame_idx]])
+            ids = dict()
+            for i, _id in enumerate(_ids):
+                ids[_id] = i
+
+        dataset_dict["video_len"] = len(video_annos)
+        dataset_dict["frame_idx"] = list(selected_idx)
+        dataset_dict["image"] = []
+        dataset_dict["depth"] = []
+        dataset_dict["instances"] = []
+        dataset_dict["file_names"] = []
+
+        for frame_idx in selected_idx:
+            dataset_dict["file_names"].append(file_names[frame_idx])
+
+            # ---------- 读取 RGB 并记录原始尺寸 ----------
+            image = utils.read_image(file_names[frame_idx], format=self.image_format)
+            utils.check_image_size(dataset_dict, image)
+            orig_h, orig_w = image.shape[:2]   # 保存 RGB 原始尺寸
+
+            # ---------- 应用 transforms 到 RGB ----------
+            aug_input = T.AugInput(image)
+            transforms = self.augmentations(aug_input)
+            image = aug_input.image
+
+            # ---------- 读取并调整深度图尺寸 ----------
+            depth = None
+            if depth_file_names is not None and frame_idx < len(depth_file_names):
+                depth_path = depth_file_names[frame_idx]
+                if depth_path.endswith(".npy"):
+                    depth = np.load(depth_path)
+                else:
+                    depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+                    if depth.ndim == 3:
+                        depth = depth[:, :, 0]
+                if depth is None:
+                    raise ValueError(f"Failed to load depth: {depth_path}")
+                depth = depth.astype(np.float32)
+
+                # 关键修正：将深度图调整到与 RGB 原始尺寸一致
+                if depth.shape[:2] != (orig_h, orig_w):
+                    depth = cv2.resize(depth, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+
+                # 归一化到 [0,1]
+                d_min = depth.min()
+                d_max = depth.max()
+                if d_max - d_min > 1e-8:
+                    depth = (depth - d_min) / (d_max - d_min)
+                else:
+                    depth = np.zeros_like(depth)
+
+                # 扩展为 3 通道并应用与 RGB 相同的 transforms
+                depth_3ch = np.repeat(depth[:, :, np.newaxis], 3, axis=2)
+                depth_transformed = transforms.apply_image(depth_3ch)
+                depth = depth_transformed[:, :, 0]
+
+                if not np.isfinite(depth).all():
+                    print(f"Non-finite values in depth file: {depth_path}")
+                    depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+
+                depth_tensor = torch.as_tensor(np.ascontiguousarray(depth[np.newaxis, :, :]), dtype=torch.float32)
+            else:
+                raise ValueError(f"depth_file_names is None or frame_idx {frame_idx} out of range")
+
+            dataset_dict["depth"].append(depth_tensor)
+
+            # ---------- 处理 RGB 张量 ----------
+            dataset_dict["image"].append(torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1))))
+
+            # ---------- 以下与原始处理相同 ----------
+            if (video_annos is None) or (not self.is_train):
+                continue
+
+            _frame_annos = []
+            for anno in video_annos[frame_idx]:
+                _anno = {}
+                for k, v in anno.items():
+                    _anno[k] = copy.deepcopy(v)
+                _frame_annos.append(_anno)
+
+            annos = [
+                utils.transform_instance_annotations(obj, transforms, image.shape[:2])
+                for obj in _frame_annos
+                if obj.get("iscrowd", 0) == 0
+            ]
+            sorted_annos = [_get_dummy_anno(self.num_classes) for _ in range(len(ids))]
+            for _anno in annos:
+                idx = ids[_anno["id"]]
+                sorted_annos[idx] = _anno
+            _gt_ids = [_anno["id"] for _anno in sorted_annos]
+
+            instances = utils.annotations_to_instances(sorted_annos, image.shape[:2], mask_format="bitmask")
+            if not self.is_tgt:
+                instances.gt_classes = torch.tensor(
+                    [self.src2tgt[c] if c in self.src2tgt else -1 for c in instances.gt_classes.tolist()]
+                )
+            instances.gt_ids = torch.tensor(_gt_ids)
+            instances = filter_empty_instances(instances)
+            if not instances.has("gt_masks"):
+                instances.gt_masks = BitMasks(torch.empty((0, *image.shape[:2])))
             dataset_dict["instances"].append(instances)
 
         return dataset_dict

@@ -10,7 +10,7 @@
 import os
 from detectron2.data.datasets.builtin_meta import _get_builtin_metadata
 from detectron2.data.datasets.coco import register_coco_instances
-from .fishtrack_ytvis import register_fishtrack_ytvis_instances
+from .fishtrack_ytvis import register_fishtrack_ytvis_instances, register_fishtrack_ytvis_depth_instances
 
 from .ytvis import (
     register_ytvis_instances,
@@ -202,11 +202,8 @@ if __name__.endswith(".builtin"):
     from . import vps
     from . import vss
 
-    _fishtrack_root = "/home/zlni/zlni/data/fishtrack_mot"
-    if os.path.exists(_fishtrack_root):
-        register_all_fishtrack_mot(_fishtrack_root)
-
-    root="/data/xyjiang/zlni/zlni/data/fishtrack_ytvis"
+    root="/data/zlni/zlni/data/fishtrack_ytvis"
+    DEPTH_ROOT = "/data/zlni/zlni/data/fishtrack_ytvis/depth"
     if os.path.exists(root):
         splits = ["train", "val"]
         for split in splits:
@@ -218,3 +215,8 @@ if __name__.endswith(".builtin"):
         
             # 执行注册
             register_fishtrack_ytvis_instances(name, _get_fishtrack_instances_meta(), json_file, image_root)
+
+            # 深度数据集注册
+            name_depth = f"fishtrack_ytvis_depth_{split}"
+            depth_root = os.path.join(DEPTH_ROOT, split)   # 深度图按 split 存放
+            register_fishtrack_ytvis_depth_instances(name_depth, _get_fishtrack_instances_meta(), json_file, image_root, depth_root)

@@ -1,0 +1,24 @@
+_BASE_: /data/xyjiang/zlni/zlni/DVIS_Plus/DVIS_Plus/configs/dvis_Plus/ovis/CTVIS_R50_fishtrack.yaml
+MODEL:
+  BACKBONE:
+    NAME: "D2VitAdapterDinoV2_LoftUP"
+  VIT_ADAPTER:
+    FINETUNE: False
+    NAME: 'vitl'
+    VIT_WEIGHT: '/data/xyjiang/zlni/zlni/data/UMOT_pretrain_weight/dvis++/dinov2_vitl14_pretrain_.pth'
+    FREEZE_VIT: True
+  PIXEL_MEAN: [123.675, 116.280, 103.530]
+  PIXEL_STD: [58.395, 57.120, 57.375]
+  MASK_FORMER:
+    NUM_OBJECT_QUERIES: 200
+  CL_PLUGIN:
+    NUM_NEGATIVES: 199
+SOLVER:
+  IMS_PER_BATCH: 16
+  STEPS: (6000, 12000)
+  MAX_ITER: 16000
+
+INPUT:
+  SAMPLING_FRAME_NUM: 5 #11
+  SAMPLING_FRAME_RANGE: 8 #5
+OUTPUT_DIR: '/data/xyjiang/zlni/zlni/data/UMOT_weight/research/loftup/DINOv2/CTVIS'

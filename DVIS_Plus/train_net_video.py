@@ -48,6 +48,7 @@ from mask2former_video import add_maskformer2_video_config
 from dvis_Plus import (
     YTVISDatasetMapper,
     CocoClipDatasetMapper,
+    DepthYTVISDatasetMapper,
     PanopticDatasetVideoMapper,
     SemanticDatasetVideoMapper,
     YTVISEvaluator,
@@ -63,14 +64,19 @@ from dvis_Plus import (
 )
 
 import sys
-sys.path.append("/data/xyjiang/zlni/zlni/DVIS_Plus/DVIS_Plus")
+sys.path.append("/data/zlni/zlni/DVIS_Plus/DVIS_Plus")
 from research.modeling.backbone.sam2_hiera import SAM2HieraBackbone
+from research.modeling.backbone.sam2_loftup import SAM2LoftupBackbone
+from research.modeling.backbone.sam2_anyup import SAM2AnyupBackbone
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 import research.modeling.sam2_meta_architecture
 import research.modeling.sam2_CTMinVIS
+import research.modeling.freeze_CTMinVIS
+from  research.modeling.feedback_meta_architecture import DVIS_Plus_online_Feedback
+from research.modeling.attnmask_refine import DVIS_Plus_online_AttnMaskRefine
 
 class Trainer(DefaultTrainer):
     """
@@ -98,19 +104,36 @@ class Trainer(DefaultTrainer):
         assert len(cfg.DATASETS.DATASET_RATIO) == len(cfg.DATASETS.TRAIN) ==\
                len(cfg.DATASETS.DATASET_NEED_MAP) == len(cfg.DATASETS.DATASET_TYPE)
         mappers = []
-        mapper_dict = {
-            'video_instance': YTVISDatasetMapper,
-            'video_panoptic': PanopticDatasetVideoMapper,
-            'video_semantic': SemanticDatasetVideoMapper,
-            'image_instance': CocoClipDatasetMapper,
-        }
-        for d_i, (dataset_name, dataset_type, dataset_need_map) in \
-                enumerate(zip(cfg.DATASETS.TRAIN, cfg.DATASETS.DATASET_TYPE, cfg.DATASETS.DATASET_NEED_MAP)):
-            if dataset_type not in mapper_dict.keys():
+        # mapper_dict = {
+        #     'video_instance': YTVISDatasetMapper,
+        #     'video_panoptic': PanopticDatasetVideoMapper,
+        #     'video_semantic': SemanticDatasetVideoMapper,
+        #     'image_instance': CocoClipDatasetMapper,
+        # }
+        # for d_i, (dataset_name, dataset_type, dataset_need_map) in \
+        #         enumerate(zip(cfg.DATASETS.TRAIN, cfg.DATASETS.DATASET_TYPE, cfg.DATASETS.DATASET_NEED_MAP)):
+        #     if dataset_type not in mapper_dict.keys():
+        #         raise NotImplementedError
+        #     _mapper = mapper_dict[dataset_type]
+        for d_i, (dataset_name, dataset_type, dataset_need_map) in enumerate(zip(
+                cfg.DATASETS.TRAIN, cfg.DATASETS.DATASET_TYPE, cfg.DATASETS.DATASET_NEED_MAP)):
+            if dataset_type == 'video_instance':
+                # 根据 cfg.INPUT.USE_DEPTH 选择 mapper
+                if getattr(cfg.INPUT, 'USE_DEPTH', False):
+                    mapper_class = DepthYTVISDatasetMapper
+                else:
+                    mapper_class = YTVISDatasetMapper
+            elif dataset_type == 'video_panoptic':
+                mapper_class = PanopticDatasetVideoMapper
+            elif dataset_type == 'video_semantic':
+                mapper_class = SemanticDatasetVideoMapper
+            elif dataset_type == 'image_instance':
+                mapper_class = CocoClipDatasetMapper
+            else:
                 raise NotImplementedError
-            _mapper = mapper_dict[dataset_type]
+
             mappers.append(
-                _mapper(cfg, is_train=True, is_tgt=not dataset_need_map, src_dataset_name=dataset_name, )
+                mapper_class(cfg, is_train=True, is_tgt=not dataset_need_map, src_dataset_name=dataset_name, )
             )
         assert len(mappers) > 0, "No dataset is chosen!"
 
@@ -127,14 +150,25 @@ class Trainer(DefaultTrainer):
 
     @classmethod
     def build_test_loader(cls, cfg, dataset_name, dataset_type):
-        mapper_dict = {
-            'video_instance': YTVISDatasetMapper,
-            'video_panoptic': PanopticDatasetVideoMapper,
-            'video_semantic': SemanticDatasetVideoMapper,
-        }
-        if dataset_type not in mapper_dict.keys():
+        # mapper_dict = {
+        #     'video_instance': YTVISDatasetMapper,
+        #     'video_panoptic': PanopticDatasetVideoMapper,
+        #     'video_semantic': SemanticDatasetVideoMapper,
+        # }
+        # if dataset_type not in mapper_dict.keys():
+        #     raise NotImplementedError
+        # mapper = mapper_dict[dataset_type](cfg, is_train=False)
+        if dataset_type == 'video_instance':
+            if getattr(cfg.INPUT, 'USE_DEPTH', False):
+                mapper = DepthYTVISDatasetMapper(cfg, is_train=False)
+            else:
+                mapper = YTVISDatasetMapper(cfg, is_train=False)
+        elif dataset_type == 'video_panoptic':
+            mapper = PanopticDatasetVideoMapper(cfg, is_train=False)
+        elif dataset_type == 'video_semantic':
+            mapper = SemanticDatasetVideoMapper(cfg, is_train=False)
+        else:
             raise NotImplementedError
-        mapper = mapper_dict[dataset_type](cfg, is_train=False)
         return build_detection_test_loader(cfg, dataset_name, mapper=mapper)
 
     @classmethod
@@ -312,6 +346,8 @@ def setup(args):
 def main(args):
     cfg = setup(args)
 
+    torch.autograd.set_detect_anomaly(False)
+
     if args.eval_only:
         model = Trainer.build_model(cfg)
         DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
@@ -326,7 +362,9 @@ def main(args):
 
     trainer = Trainer(cfg)
     trainer.resume_or_load(resume=args.resume)
+
     return trainer.train()
+
 
 
 if __name__ == "__main__":

@@ -18,6 +18,8 @@ def add_maskformer2_config(cfg):
     # Pad image and segmentation GT in dataset mapper.
     cfg.INPUT.SIZE_DIVISIBILITY = -1
 
+    cfg.INPUT.USE_DEPTH = False   # 是否使用深度数据
+
     # solver config
     # weight decay on embedding
     cfg.SOLVER.WEIGHT_DECAY_EMBED = 0.0
@@ -96,6 +98,8 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.VIT_ADAPTER.FINETUNE = False
     cfg.MODEL.VIT_ADAPTER.FINETUNE_INDEXES = [0, ]
     cfg.MODEL.VIT_ADAPTER.WITH_CP = True
+    cfg.MODEL.VIT_ADAPTER.FUSION_TYPE = 'none'        # 默认不使用融合
+    cfg.MODEL.VIT_ADAPTER.DEPTH_IN_CHANNELS = 1       # 深度图输入通道数
 
     # NOTE: maskformer2 extra configs
     # transformer module

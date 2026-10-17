@@ -882,7 +882,7 @@ class DVIS_Plus_online(MinVIS):
             labels_per_image = labels[topk_indices]
             topk_indices = topk_indices // self.sem_seg_head.num_classes
             pred_masks = pred_masks[topk_indices]
-            pred_ids = pred_id[topk_indices]
+            pred_ids = pred_id.to(topk_indices.device)[topk_indices]
 
             # interpolation to original image size
             K, T, H, W = pred_masks.shape
@@ -1641,3 +1641,175 @@ class DVIS_Plus_offline(DVIS_Plus_online):
         losses = loss_reid(contrastive_items, outputs_)
         return losses
 
+@META_ARCH_REGISTRY.register()
+class DVIS_Plus_online_depth(DVIS_Plus_online):
+    """
+    支持深度输入的 DVIS_Plus_online 版本。
+    要求数据集 mapper 返回 'depth' 字段，backbone 支持 depth 输入。
+    """
+
+    def _prepare_depth_tensor(self, depths, final_h, final_w):
+        """
+        将深度图列表堆叠并填充到与 images.tensor 相同的尺寸。
+        Args:
+            depths: list of tensors, each shape (1, H, W)
+            final_h, final_w: 目标尺寸
+        Returns:
+            depth_tensor: (B*T, 1, final_h, final_w)
+        """
+        padded_depths = []
+        for depth in depths:
+            h, w = depth.shape[-2:]
+            pad_h = final_h - h
+            pad_w = final_w - w
+            if pad_h > 0 or pad_w > 0:
+                # 填充值 0（深度已归一化到 [0,1]）
+                depth = F.pad(depth, (0, pad_w, 0, pad_h), mode='constant', value=0)
+            padded_depths.append(depth)
+        return torch.stack(padded_depths, dim=0)
+
+    def forward(self, batched_inputs):
+        """
+        重写 forward，从输入中提取深度并传入 backbone。
+        """
+        # 🌟 核心修复点：补齐被遗漏的 keep 属性初始化，打通时序跟踪通道
+        if 'keep' in batched_inputs[0].keys():
+            self.keep = batched_inputs[0]['keep']
+        else:
+            self.keep = False
+
+        # 提取 RGB 和深度
+        images = []
+        depths = []
+        for video in batched_inputs:
+            for frame in video["image"]:
+                images.append(frame.to(self.device))
+            if "depth" in video:
+                for depth in video["depth"]:
+                    depths.append(depth.to(self.device))
+            else:
+                raise ValueError("Depth data missing in DVIS_Plus_online_depth")
+
+        pixel_mean = self.pixel_mean
+        pixel_std = self.pixel_std
+        images = [(x - pixel_mean) / pixel_std for x in images]
+        images = ImageList.from_tensors(images, self.size_divisibility)
+
+        # 准备深度张量
+        final_h, final_w = images.tensor.shape[-2:]
+        depth_tensor = self._prepare_depth_tensor(depths, final_h, final_w)
+
+        if not self.training and self.window_inference:
+            # 推理窗口模式：传入深度
+            outputs = self.run_window_inference(images.tensor, depth_tensor, window_size=self.window_size)
+        else:
+            # 原 DVIS_Plus_online 的训练/推理逻辑，但使用深度
+            self.backbone.eval()
+            self.sem_seg_head.eval()
+            with torch.no_grad():
+                features = self.backbone(images.tensor, depth_tensor)  # 传入深度
+                image_outputs = self.sem_seg_head(features)
+                object_labels = self._get_instance_labels(image_outputs['pred_logits'])
+                frame_embds = image_outputs['pred_embds'].clone().detach()
+                frame_embds_no_norm = image_outputs['pred_embds_without_norm'].clone().detach()
+                mask_features = image_outputs['mask_features'].clone().detach().unsqueeze(0)
+                del image_outputs['mask_features']
+                torch.cuda.empty_cache()
+            outputs, indices = self.tracker(frame_embds, mask_features, return_indices=True,
+                                            resume=self.keep, frame_classes=object_labels,
+                                            frame_embeds_no_norm=frame_embds_no_norm)
+            image_outputs = self.reset_image_output_order(image_outputs, indices)
+
+        if self.training:
+            targets = self.prepare_targets(batched_inputs, images)
+            image_outputs, outputs, targets = self.frame_decoder_loss_reshape(
+                outputs, targets, image_outputs=image_outputs
+            )
+            if self.iter < self.max_iter_num // 2:
+                losses, reference_match_result = self.criterion(outputs, targets,
+                                                                matcher_outputs=image_outputs,
+                                                                ret_match_result=True)
+            else:
+                losses, reference_match_result = self.criterion(outputs, targets,
+                                                                matcher_outputs=None,
+                                                                ret_match_result=True)
+            if self.use_cl:
+                losses_cl = self.get_cl_loss_ref(outputs, reference_match_result)
+                losses.update(losses_cl)
+
+            self.iter += 1
+
+            for k in list(losses.keys()):
+                if k in self.criterion.weight_dict:
+                    losses[k] *= self.criterion.weight_dict[k]
+                else:
+                    losses.pop(k)
+            return losses
+        else:
+            outputs = self.post_processing(outputs)
+            mask_cls_results = outputs["pred_logits"]
+            mask_pred_results = outputs["pred_masks"]
+            pred_ids = outputs["ids"]
+
+            mask_cls_result = mask_cls_results[0]
+            mask_pred_result = mask_pred_results[0]
+            pred_id = pred_ids[0]
+            first_resize_size = (images.tensor.shape[-2], images.tensor.shape[-1])
+
+            input_per_image = batched_inputs[0]
+            image_size = images.image_sizes[0]
+            height = input_per_image.get("height", image_size[0])
+            width = input_per_image.get("width", image_size[1])
+
+            del images, input_per_image
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            return retry_if_cuda_oom(self.inference_video_task)(
+                mask_cls_result, mask_pred_result, image_size, height, width, first_resize_size, pred_id
+            )
+
+    def run_window_inference(self, images_tensor, depth_tensor, window_size=30):
+        """
+        重写窗口推理以接收深度张量。
+        """
+        iters = len(images_tensor) // window_size
+        if len(images_tensor) % window_size != 0:
+            iters += 1
+        out_list = []
+
+        for i in range(iters):
+            start_idx = i * window_size
+            end_idx = (i + 1) * window_size
+
+            # 传入对应的深度切片
+            features = self.backbone(images_tensor[start_idx:end_idx], depth_tensor[start_idx:end_idx])
+            out = self.sem_seg_head(features)
+            del features['res2'], features['res3'], features['res4'], features['res5']
+            for j in range(len(out['aux_outputs'])):
+                del out['aux_outputs'][j]['pred_masks'], out['aux_outputs'][j]['pred_logits']
+            frame_embds = out['pred_embds']
+            frame_embds_no_norm = out['pred_embds_without_norm']
+            mask_features = out['mask_features'].unsqueeze(0)
+            if i != 0 or self.keep:
+                track_out = self.tracker(frame_embds, mask_features,
+                                         resume=True, frame_embeds_no_norm=frame_embds_no_norm)
+            else:
+                track_out = self.tracker(frame_embds, mask_features, frame_embeds_no_norm=frame_embds_no_norm)
+            del mask_features
+            for j in range(len(track_out['aux_outputs'])):
+                del track_out['aux_outputs'][j]['pred_masks'], track_out['aux_outputs'][j]['pred_logits']
+            track_out['pred_logits'] = track_out['pred_logits'].to(torch.float32).detach().cpu()
+            track_out['pred_masks'] = track_out['pred_masks'].to(torch.float32).detach().cpu()
+            track_out['pred_embds'] = track_out['pred_embds'].to(torch.float32).detach().cpu()
+            out_list.append(track_out)
+
+            del frame_embds, frame_embds_no_norm, out
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        outputs = {}
+        outputs['pred_logits'] = torch.cat([x['pred_logits'] for x in out_list], dim=1)
+        outputs['pred_masks'] = torch.cat([x['pred_masks'] for x in out_list], dim=2)
+        outputs['pred_embds'] = torch.cat([x['pred_embds'] for x in out_list], dim=2)
+        return outputs

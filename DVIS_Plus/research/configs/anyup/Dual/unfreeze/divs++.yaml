@@ -1,0 +1,15 @@
+_BASE_: /data/xyjiang/zlni/zlni/DVIS_Plus/DVIS_Plus/configs/dvis_Plus/ovis//DVIS_Plus_Online_R50_fishtrack.yaml
+MODEL:
+  BACKBONE:
+    NAME: "D2VitAdapterDinoV2_AnyUP_DualPath_Direct"
+  VIT_ADAPTER:
+    FINETUNE: True
+    FINETUNE_INDEXES: [0, 1, 2, 3]
+    NAME: 'vitb'
+    VIT_WEIGHT: '/data/xyjiang/zlni/zlni/data/DINIOv2/dinov2_vitb14_pretrain.pth'
+    FREEZE_VIT: False
+  PIXEL_MEAN: [123.675, 116.280, 103.530]
+  PIXEL_STD: [58.395, 57.120, 57.375]
+  MASK_FORMER:
+    NUM_OBJECT_QUERIES: 200
+OUTPUT_DIR: '/data/xyjiang/zlni/zlni/data/UMOT_weight/research/anyup/Dual/DINOv2B/unfreeze_DINO/DVIS_Plus_Online'

@@ -12,6 +12,7 @@ from .ctvis import CTMinVIS, CTCLPlugin
 from .data_video import (
     YTVISDatasetMapper,
     CocoClipDatasetMapper,
+    DepthYTVISDatasetMapper,
     YTVISEvaluator,
     PanopticDatasetVideoMapper,
     SemanticDatasetVideoMapper,

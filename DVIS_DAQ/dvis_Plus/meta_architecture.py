@@ -1,6 +1,5 @@
 from typing import Tuple
-import einops
-
+import  gc
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -381,11 +380,30 @@ class MinVIS(nn.Module):
                 pred_masks, size=(output_height, output_width), mode="bilinear", align_corners=False
             )
 
-            masks = pred_masks > 0.
 
             out_scores = scores_per_image.tolist()
             out_labels = labels_per_image.tolist()
-            out_masks = [m for m in masks.cpu()]
+            N_objs, T_frames, H, W = pred_masks.shape
+
+            out_masks = [[] for _ in range(N_objs)]
+
+            for t in range(T_frames):
+                for i in range(N_objs):
+                    single_mask = (pred_masks[i, t] > 0.0).cpu().numpy().astype(np.uint8)
+
+                    rle = mask_util.encode(np.asfortranarray(single_mask[:, :, np.newaxis]))[0]
+                    rle["counts"] = rle["counts"].decode("utf-8")
+
+                    out_masks[i].append(rle)
+
+                    del single_mask
+
+                if t % 50 == 0:
+                    gc.collect()
+
+            del pred_masks
+            torch.cuda.empty_cache()
+            gc.collect()
         else:
             out_scores = []
             out_labels = []
@@ -835,20 +853,32 @@ class DVIS_Plus_online(MinVIS):
             pred_ids = pred_id[topk_indices]
 
             # interpolation to original image size
-            pred_masks = F.interpolate(
-                pred_masks, size=first_resize_size, mode="bilinear", align_corners=False
-            )
-            pred_masks = pred_masks[:, :, : img_size[0], : img_size[1]]
-            pred_masks = F.interpolate(
-                pred_masks, size=(output_height, output_width), mode="bilinear", align_corners=False
-            )
-            masks = pred_masks > 0.
-            del pred_masks
+            K, T, H, W = pred_masks.shape
+            out_masks = []
+              
+            if pred_masks.device != torch.device('cpu'):
+                pred_masks = pred_masks.cpu()
+
+            for i in range(K):
+                rles = []
+                for t in range(T):
+                    mask_i_t = pred_masks[i:i+1, t:t+1].float().to(self.device)
+                    mask_i_t = F.interpolate(mask_i_t, size=first_resize_size, mode="bilinear", align_corners=False)
+                    mask_i_t = mask_i_t[:, :, : img_size[0], : img_size[1]]
+                    mask_i_t = F.interpolate(mask_i_t, size=(output_height, output_width), mode="bilinear", align_corners=False)
+                    mask_i_t = (mask_i_t[0, 0] > 0.).cpu().numpy().astype(np.uint8)
+                      
+                    rle = mask_util.encode(np.array(mask_i_t[:, :, None], order="F", dtype="uint8"))[0]
+                    rle["counts"] = rle["counts"].decode("utf-8")
+                    rles.append(rle)
+                  
+                out_masks.append(rles)
 
             out_scores = scores_per_image.tolist()
             out_labels = labels_per_image.tolist()
             out_ids = pred_ids.tolist()
-            out_masks = [m for m in masks.cpu()]
+            del pred_masks
+
         else:
             out_scores = []
             out_labels = []

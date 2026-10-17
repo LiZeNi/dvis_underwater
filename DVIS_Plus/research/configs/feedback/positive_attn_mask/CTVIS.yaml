@@ -1,0 +1,30 @@
+_BASE_: /data/zlni/zlni/DVIS_Plus/DVIS_Plus/configs/dvis_Plus/ovis/CTVIS_R50_fishtrack.yaml
+MODEL:
+  BACKBONE:
+    NAME: "D2VitAdapterDinoV2"
+  VIT_ADAPTER:
+    FINETUNE: False
+    NAME: 'vitl'
+    VIT_WEIGHT: '/data/zlni/zlni/data/UMOT_pretrain_weight/dvis++/dinov2_vitl14_pretrain_.pth'
+    FREEZE_VIT: True
+  PIXEL_MEAN: [123.675, 116.280, 103.530]
+  PIXEL_STD: [58.395, 57.120, 57.375]
+  MASK_FORMER:
+    NUM_OBJECT_QUERIES: 200
+    TRANSFORMER_DECODER_NAME: "VideoMultiScaleMaskedTransformerDecoder_dvisPlusPositiveAttnMask"
+  CL_PLUGIN:
+    NUM_NEGATIVES: 199
+SOLVER:
+  IMS_PER_BATCH: 16
+  STEPS: (6000, 12000)
+  MAX_ITER: 16000
+  CLIP_GRADIENTS:
+    ENABLED: True
+    CLIP_TYPE: "full_model"
+    CLIP_VALUE: 0.01          # 🌟 限制最大范数为 0.01，这是 Mask2Former 提分防崩溃的标配参数 [2]
+    NORM_TYPE: 2.0
+
+INPUT:
+  SAMPLING_FRAME_NUM: 5 #11
+  SAMPLING_FRAME_RANGE: 8 #5
+OUTPUT_DIR: '/data/zlni/zlni/data/UMOT_weight/dvis++/feedback/positive_attn_mask/DINO_vitl/CTVIS_DINO2_OVIS'

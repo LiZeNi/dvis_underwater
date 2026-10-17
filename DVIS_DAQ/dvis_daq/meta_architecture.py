@@ -1,4 +1,5 @@
 import copy
+import psutil
 import logging
 import os.path
 import random
@@ -7,7 +8,7 @@ import einops
 import numpy as np
 from collections import defaultdict
 from PIL import Image
-
+import gc
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -29,6 +30,17 @@ from .refiner import TemporalRefiner
 from mask2former_video.modeling.criterion import VideoSetCriterion as DVIS_VideoSetCriterion
 from mask2former_video.modeling.matcher import VideoHungarianMatcher as DVIS_VideoHungarianMatcher
 
+# 🌟 DEBUG: 内存监控探针
+# =========================================================================
+def print_mem(prefix=""):
+    process = psutil.Process(os.getpid())
+    cpu_mem = process.memory_info().rss / 1024 / 1024 / 1024  # GB
+    if torch.cuda.is_available():
+        gpu_mem = torch.cuda.memory_allocated() / 1024 / 1024 / 1024  # GB
+        gpu_max = torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024
+        print(f"[{prefix}] | CPU RAM: {cpu_mem:.2f} GB | GPU VRAM: {gpu_mem:.2f} GB (Max: {gpu_max:.2f} GB)")
+    else:
+        print(f"[{prefix}] | CPU RAM: {cpu_mem:.2f} GB")
 
 @META_ARCH_REGISTRY.register()
 class DVIS_DAQ_online(MinVIS):
@@ -343,7 +355,9 @@ class DVIS_DAQ_online(MinVIS):
         return losses
 
     def inference(self, batched_inputs, window_size=5):
-        # for running demo on very long videos
+        # ----------------- 🌟 DEBUG: 监控单个视频的生命周期 -----------------
+        print_mem(f"视频开始 | ID: {batched_inputs[0].get('file_names', ['Unknown'])[0].split('/')[0]}")
+        
         if 'keep' in batched_inputs[0].keys():
             self.keep = batched_inputs[0]['keep']
         else:
@@ -357,14 +371,23 @@ class DVIS_DAQ_online(MinVIS):
         images = []
         for video in batched_inputs:
             for frame in video["image"]:
-                images.append(frame.to(self.device))
-        images = [(x - self.pixel_mean) / self.pixel_std for x in images]
+                # 为了省显存，图片只留在 CPU，等需要跑网络时再挪到 GPU
+                images.append(frame)
+                
+        # 极轻量的归一化构建
+        pixel_mean = self.pixel_mean.cpu()
+        pixel_std = self.pixel_std.cpu()
+        images = [(x - pixel_mean) / pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
+        
         num_frames = len(images.tensor)
+        print_mem(f"图像数据打包完成 (总帧数: {num_frames})")
+
         outputs = self.run_window_inference(images.tensor, window_size=window_size, long_video_start_fidx=long_video_start_fidx)
         H, W = outputs["shape"]
 
         if len(outputs["pred_logits"]) == 0:
+            print_mem("空预测返回，清空内存并退出")
             video_output = {
                 "image_size": images.image_sizes[0],
                 "pred_scores": [],
@@ -375,6 +398,7 @@ class DVIS_DAQ_online(MinVIS):
                 "task": self.task,
             }
             return video_output
+            
         mask_cls_results = outputs["pred_logits"]  # b, n, k+1
         mask_pred_results = outputs["pred_masks"]  # b, n, t, h, w
         pred_ids = [torch.arange(0, outputs['pred_masks'].size(1))]
@@ -386,19 +410,30 @@ class DVIS_DAQ_online(MinVIS):
         first_resize_size = (images.tensor.shape[-2], images.tensor.shape[-1])
 
         input_per_image = batched_inputs[0]
-        image_size = images.image_sizes[0]  # image size without padding after data augmentation
-
-        height = input_per_image.get('height', image_size[0])  # raw image size before data augmentation
+        image_size = images.image_sizes[0]  
+        height = input_per_image.get('height', image_size[0])  
         width = input_per_image.get('width', image_size[1])
 
+        print_mem("进入 inference_video_task 之前")
+        
         if self.task == "vos":
-            return retry_if_cuda_oom(self.inference_video_vos)(
+            res = retry_if_cuda_oom(self.inference_video_vos)(
                 batched_inputs[0], outputs, first_resize_size, image_size
             )
         else:
-            return retry_if_cuda_oom(self.inference_video_task)(
+            res = retry_if_cuda_oom(self.inference_video_task)(
                 mask_cls_result, mask_pred_result, image_size, height, width, first_resize_size, pred_id,
             )
+            
+        print_mem(f"视频结束 | 准备返回")
+        
+        # 🌟 强制删除占用巨大内存的输出结果字典
+        del outputs, mask_cls_results, mask_pred_results, mask_cls_result, mask_pred_result
+        del images, input_per_image
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        return res
 
     def prepare_targets(self, targets, images, select_fi_set):  # TODO, datamapper match with the function
         h_pad, w_pad = images.tensor.shape[-2:]
@@ -450,11 +485,10 @@ class DVIS_DAQ_online(MinVIS):
     def split_video_targets(self, clip_targets, clip_len=1):
         clip_target_splits = dict()
         for targets_per_video in clip_targets:
-            labels = targets_per_video["labels"]  # Ni (number of instances)
-
-            ids = targets_per_video["ids"]  # Ni, T
-            masks = targets_per_video["masks"]  # Ni, T, H, W
-            frame_idx = targets_per_video["frame_idx"]  # T
+            labels = targets_per_video["labels"]  
+            ids = targets_per_video["ids"]  
+            masks = targets_per_video["masks"] 
+            frame_idx = targets_per_video["frame_idx"] 
 
             masks_splits = masks.split(clip_len, dim=1)
             ids_splits = ids.split(clip_len, dim=1)
@@ -488,25 +522,27 @@ class DVIS_DAQ_online(MinVIS):
     def run_window_inference(self, images_tensor, window_size=30, long_video_start_fidx=-1):
         video_start_idx = long_video_start_fidx if long_video_start_fidx >= 0 else 0
 
-        window_size = 5
         num_frames = len(images_tensor)
         to_store = "cpu"
         iters = len(images_tensor) // window_size
         if len(images_tensor) % window_size != 0:
             iters += 1
+            
         for i in range(iters):
             start_idx = i * window_size
             end_idx = (i + 1) * window_size
-            # segmenter inference
-            features = self.backbone(images_tensor[start_idx:end_idx])
+            
+            # 将当前窗口的帧送到 GPU
+            chunk_images = images_tensor[start_idx:end_idx].to(self.device)
+            features = self.backbone(chunk_images)
             out = self.sem_seg_head(features)
-            # remove unnecessary variables to save GPU memory
+            
             del features['res2'], features['res3'], features['res4'], features['res5']
             for j in range(len(out['aux_outputs'])):
                 del out['aux_outputs'][j]['pred_masks'], out['aux_outputs'][j]['pred_logits']
-            # referring tracker inference
-            frame_embds = out['pred_embds']  # (b, c, t, q)
-            mask_features = out['mask_features'].unsqueeze(0)  # as B == 1
+                
+            frame_embds = out['pred_embds']  
+            mask_features = out['mask_features'].unsqueeze(0)  
             pred_logits, pred_masks = out["pred_logits"].flatten(0, 1), out["pred_masks"].transpose(1, 2).flatten(0, 1)
 
             B, _, T, Q = frame_embds.shape
@@ -519,9 +555,12 @@ class DVIS_DAQ_online(MinVIS):
                 new_pred_logits.append([pred_logits[b * T + t] for b in range(B)])
                 new_pred_masks.append([pred_masks[b * T + t] for b in range(B)])
                 new_valid_masks.append([valid_masks[b * T + t] for b in range(B)])
-            frame_info = {"pred_logits": new_pred_logits, "pred_masks": new_pred_masks, "valid": new_valid_masks,
-                          "seg_query_feat": self.sem_seg_head.predictor.query_feat,
-                          "seg_query_embed": self.sem_seg_head.predictor.query_embed}
+                
+            frame_info = {
+                "pred_logits": new_pred_logits, "pred_masks": new_pred_masks, "valid": new_valid_masks,
+                "seg_query_feat": self.sem_seg_head.predictor.query_feat,
+                "seg_query_embed": self.sem_seg_head.predictor.query_embed
+            }
 
             if i != 0 or self.keep:
                 self.tracker.inference(frame_embds, mask_features, frame_info,
@@ -529,54 +568,75 @@ class DVIS_DAQ_online(MinVIS):
             else:
                 self.tracker.inference(frame_embds, mask_features, frame_info,
                                        video_start_idx + start_idx, to_store=to_store)
+                                       
+            # 🌟 DEBUG: 监控单步窗口执行完的内存
+            print_mem(f"Window {i+1}/{iters} 完成")
+            
+            # 清理计算图残余
+            del chunk_images, features, out, frame_embds, mask_features, pred_logits, pred_masks
+            gc.collect()
+            torch.cuda.empty_cache()
 
+        # 开始整理整个视频的序列
         logits_list = []
         full_logits_list = []
         masks_list = []
         seq_id_list = []
         dead_seq_id_list = []
         padding_mask_list = []
-        for seq_id, ins_seq in self.tracker.video_ins_hub.items():
+        
+        # 🌟 获取并清理 tracker 中的死亡序列
+        hub_items = list(self.tracker.video_ins_hub.items())
+        print_mem(f"合并视频序列开始... 当前 Tracker Hub 中保存的序列条数: {len(hub_items)}")
+        
+        for seq_id, ins_seq in hub_items:
             if len(ins_seq.pred_masks) < self.noise_frame_num:
-                # if ins_seq.sT + len(ins_seq.pred_masks) == num_frames, which means this object appeared at the end of
-                # this clip and cloud be exists in the next clip.
                 if ins_seq.sT + len(ins_seq.pred_masks) < video_start_idx + num_frames:
                     continue
-            full_masks = torch.ones(num_frames, H, W).to(torch.float32).to(to_store) * -1e4
-            full_logits = torch.ones(num_frames, self.sem_seg_head.num_classes + 1).to(torch.float32).to("cuda") * -1e4
+            
+            # 使用 float16 极大地减少 RAM 占用
+            full_masks = torch.ones(num_frames, H, W, dtype=torch.float16, device=to_store) * -1e4
+            full_logits = torch.ones(num_frames, self.sem_seg_head.num_classes + 1, dtype=torch.float16, device="cuda") * -1e4
             full_logits[:, -1] = 1.
-            padding_mask = torch.ones(size=(num_frames, )) > 0
+            padding_mask = torch.ones(size=(num_frames, ), dtype=torch.bool, device="cuda")
+            
             seq_logits = []
             seq_start_t = ins_seq.sT
             for j in range(len(ins_seq.pred_masks)):
                 if seq_start_t + j < video_start_idx:
                     continue
                 re_j = seq_start_t + j - video_start_idx
-                full_masks[re_j, :, :] = ins_seq.pred_masks[j]
-                full_logits[re_j, :] = ins_seq.pred_logits[j]
+                
+                # 存入半精度
+                full_masks[re_j, :, :] = ins_seq.pred_masks[j].to(torch.float16)
+                full_logits[re_j, :] = ins_seq.pred_logits[j].to(torch.float16)
                 padding_mask[re_j] = False
                 seq_logits.append(ins_seq.pred_logits[j])
+                
             if len(seq_logits) == 0:
                 continue
-            seq_logits = torch.stack(seq_logits, dim=0).mean(0)  # n, c -> c
-            logits_list.append(seq_logits)
+                
+            seq_logits = torch.stack(seq_logits, dim=0).mean(0) 
+            logits_list.append(seq_logits.cpu())
             masks_list.append(full_masks)
-            full_logits_list.append(full_logits)
-            padding_mask_list.append(padding_mask)
+            full_logits_list.append(full_logits.cpu())
+            padding_mask_list.append(padding_mask.cpu())
+            
             assert ins_seq.gt_id == seq_id
             seq_id_list.append(seq_id)
-            if ins_seq.dead:
+            if getattr(ins_seq, 'dead', False):
                 dead_seq_id_list.append(seq_id)
 
-        for seq_id in dead_seq_id_list:  # for handling large long videos, saving memory
-            self.tracker.video_ins_hub.pop(seq_id)
+        # 清除已死序列
+        for seq_id in dead_seq_id_list:  
+            self.tracker.video_ins_hub.pop(seq_id, None)
 
         if len(logits_list) > 0:
-            pred_cls = torch.stack(logits_list, dim=0)[None, ...]  # b, n, c
-            pred_masks = torch.stack(masks_list, dim=0)[None, ...]  # b, n, t, h, w
-            pred_ids = torch.as_tensor(seq_id_list).to(torch.int64)[None, :]  # b, n
-            padding_masks = torch.stack(padding_mask_list, dim=0)[None, ...]  # b, n, t
-            full_logits_tensor = torch.stack(full_logits_list)[None, ...]  # b, n, t, c
+            pred_cls = torch.stack(logits_list, dim=0)[None, ...]  
+            pred_masks = torch.stack(masks_list, dim=0)[None, ...]  
+            pred_ids = torch.as_tensor(seq_id_list).to(torch.int64)[None, :]  
+            padding_masks = torch.stack(padding_mask_list, dim=0)[None, ...]  
+            full_logits_tensor = torch.stack(full_logits_list)[None, ...] 
         else:
             pred_cls = []
             pred_masks = []
@@ -592,7 +652,11 @@ class DVIS_DAQ_online(MinVIS):
             "padding_masks": padding_masks,
             "full_logits": full_logits_tensor,
         }
-
+        
+        # 🌟 极其重要：每个视频处理完毕后，强制清空 Hub
+        self.tracker.video_ins_hub.clear()
+        
+        print_mem("run_window_inference 结束")
         return outputs
 
     def inference_video_vos(self, targets, outputs, img_pad_size, image_size):
@@ -703,38 +767,53 @@ class DVIS_DAQ_online(MinVIS):
 
     def inference_video_vis(
             self, pred_cls, pred_masks, img_size, output_height, output_width,
-            first_resize_size, pred_id, aux_pred_cls=None
+            first_resize_size, pred_id, aux_pred_cls=None,
     ):
+        print_mem(f"开始执行 RLE 编码转换 (待处理 Mask 形状: {pred_masks.shape})")
         if len(pred_cls) > 0:
-            scores = F.softmax(pred_cls, dim=-1)[:, :-1]
+            scores = F.softmax(pred_cls.float(), dim=-1)[:, :-1]
             if aux_pred_cls is not None:
-                aux_pred_cls = F.softmax(aux_pred_cls, dim=-1)[:, :-1]
+                aux_pred_cls = F.softmax(aux_pred_cls.float(), dim=-1).to(aux_pred_cls.dtype)[:, :-1]
                 scores = torch.maximum(scores, aux_pred_cls.to(scores))
             labels = torch.arange(
                 self.sem_seg_head.num_classes, device=self.device
             ).unsqueeze(0).repeat(scores.shape[0], 1).flatten(0, 1)
-            # keep top-K predictions
-            scores_per_image, topk_indices = scores.flatten(0, 1).topk(self.max_num, sorted=False)
+            
+            # 🌟 极度重要：限制最大输出个数，阻断内存飙升
+            max_n = min(self.max_num, scores.shape[1]) if len(scores.shape)>1 else self.max_num
+            scores_per_image, topk_indices = scores.flatten(0, 1).topk(max_n, sorted=False)
+            
             labels_per_image = labels[topk_indices]
             topk_indices = topk_indices // self.sem_seg_head.num_classes
+            
             pred_masks = pred_masks[topk_indices.to(pred_masks.device)]
             pred_ids = pred_id[topk_indices.to(pred_id.device)]
 
-            # interpolation to original image size
-            pred_masks = F.interpolate(
-                pred_masks, size=first_resize_size, mode="bilinear", align_corners=False
-            )
-            pred_masks = pred_masks[:, :, : img_size[0], : img_size[1]]
-            pred_masks = F.interpolate(
-                pred_masks, size=(output_height, output_width), mode="bilinear", align_corners=False
-            )
-            masks = pred_masks > 0.
-            del pred_masks
+            K, T, H, W = pred_masks.shape
+            out_masks = []
+              
+            if pred_masks.device != torch.device('cpu'):
+                pred_masks = pred_masks.cpu()
+
+            for i in range(K):
+                rles = []
+                for t in range(T):
+                    mask_i_t = pred_masks[i:i+1, t:t+1].float().to(self.device)
+                    mask_i_t = F.interpolate(mask_i_t, size=first_resize_size, mode="bilinear", align_corners=False)
+                    mask_i_t = mask_i_t[:, :, : img_size[0], : img_size[1]]
+                    mask_i_t = F.interpolate(mask_i_t, size=(output_height, output_width), mode="bilinear", align_corners=False)
+                    mask_i_t = (mask_i_t[0, 0] > 0.).cpu().numpy().astype(np.uint8)
+                      
+                    rle = mask_util.encode(np.array(mask_i_t[:, :, None], order="F", dtype="uint8"))[0]
+                    rle["counts"] = rle["counts"].decode("utf-8")
+                    rles.append(rle)
+                  
+                out_masks.append(rles)
 
             out_scores = scores_per_image.tolist()
             out_labels = labels_per_image.tolist()
             out_ids = pred_ids.tolist()
-            out_masks = [m for m in masks.cpu()]
+            del pred_masks
         else:
             out_scores = []
             out_labels = []
@@ -749,7 +828,7 @@ class DVIS_DAQ_online(MinVIS):
             "pred_ids": out_ids,
             "task": "vis",
         }
-
+        print_mem(f"RLE 转换完成")
         return video_output
 
     def inference_video_vps(

@@ -17,8 +17,8 @@ MODEL:
     OVIS_INFER: True
 
 SOLVER:
-  IMS_PER_BATCH: 8
-  BASE_LR: 0.0001
+  IMS_PER_BATCH: 2 #8
+  BASE_LR: 0.000025 #0.0001
   STEPS: (28000,)
   MAX_ITER: 40000
   CHECKPOINT_PERIOD: 5000
@@ -32,5 +32,6 @@ INPUT:
 
 TEST:
   EVAL_PERIOD: 0
-
-OUTPUT_DIR: '/home/zlni/zlni/data/UMOT_weight/dvis_daq/DVIS_Plus_Offline_R50_OVIS'
+DATALOADER:
+  NUM_WORKERS: 0
+OUTPUT_DIR: '/data/xyjiang/zlni/zlni/data/UMOT_weight/dvis_daq/DVIS_Plus_Online_R50_OVIS'

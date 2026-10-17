@@ -128,18 +128,15 @@ class DVIS_Plus_SAM2_online(DVIS_Plus_online):
         else:
             # self.backbone.eval()
             # self.sem_seg_head.eval()
-            # 1. 使用SAM 2 的 Backbone
-                
-            # 3. DVIS 的 MaskFormerHead
-            features = self.backbone(images.tensor)
-            image_outputs = self.sem_seg_head(features)
-            object_labels = self._get_instance_labels(image_outputs['pred_logits'])
-                
-            frame_embds = image_outputs['pred_embds'].clone().detach()  
-            frame_embds_no_norm = image_outputs['pred_embds_without_norm'].clone().detach() 
-            mask_features = image_outputs['mask_features'].clone().detach().unsqueeze(0)
-            del image_outputs['mask_features']
-            torch.cuda.empty_cache()
+            with torch.no_grad():
+                features = self.backbone(images.tensor)
+                image_outputs = self.sem_seg_head(features)
+                object_labels = self._get_instance_labels(image_outputs['pred_logits'])
+                frame_embds = image_outputs['pred_embds'].clone().detach()  
+                frame_embds_no_norm = image_outputs['pred_embds_without_norm'].clone().detach() 
+                mask_features = image_outputs['mask_features'].clone().detach().unsqueeze(0)
+                del image_outputs['mask_features']
+                torch.cuda.empty_cache()
                 
             outputs, indices = self.tracker(
                 frame_embds, mask_features, return_indices=True,

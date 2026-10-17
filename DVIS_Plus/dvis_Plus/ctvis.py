@@ -887,3 +887,138 @@ def loss_reid(qd_items, outputs, reduce=False):
     losses = {'loss_reid': contras_loss.sum() / num_qd_items,
               'loss_aux_reid': aux_loss / num_qd_items}
     return losses
+
+
+@META_ARCH_REGISTRY.register()
+class CTMinVISDepth(CTMinVIS):
+    """
+    支持深度信息的 CTMinVIS 模型。
+    要求数据集 mapper 返回 'depth' 字段，backbone 支持 depth 输入。
+    """
+
+    def _prepare_depth_tensor(self, depths, final_h, final_w):
+        """
+        将深度图列表堆叠并填充到与 images.tensor 相同的尺寸。
+        Args:
+            depths: list of tensors, each shape (1, H, W)
+            final_h, final_w: 目标尺寸
+        Returns:
+            depth_tensor: (B*T, 1, final_h, final_w)
+        """
+        padded_depths = []
+        for depth in depths:
+            h, w = depth.shape[-2:]
+            pad_h = final_h - h
+            pad_w = final_w - w
+            if pad_h > 0 or pad_w > 0:
+                # 填充值 0（深度已归一化到 [0,1]，0 表示最远/最近）
+                depth = F.pad(depth, (0, pad_w, 0, pad_h), mode='constant', value=0)
+            padded_depths.append(depth)
+        return torch.stack(padded_depths, dim=0)  # (B*T, 1, final_h, final_w)
+
+    def forward(self, batched_inputs):
+        images = []
+        depths = []
+        for video in batched_inputs:
+            for frame in video["image"]:
+                images.append(frame.to(self.device))
+            if "depth" in video:
+                for depth in video["depth"]:
+                    depths.append(depth.to(self.device))
+            else:
+                raise ValueError("Depth data missing in CTMinVISDepth")
+
+        images = [(x - self.pixel_mean) / self.pixel_std for x in images]
+        images = ImageList.from_tensors(images, self.size_divisibility)
+
+        # 获取填充后的图像尺寸
+        final_h, final_w = images.tensor.shape[-2:]
+        depth_tensor = self._prepare_depth_tensor(depths, final_h, final_w)
+
+        # 在 features = self.backbone(images.tensor, depth_tensor) 之前
+        assert torch.isfinite(images.tensor).all(), "images.tensor contains NaN/Inf"
+        assert torch.isfinite(depth_tensor).all(), "depth_tensor contains NaN/Inf"
+
+        if not self.training and self.window_inference:
+            outputs = self.run_window_inference(images.tensor, depth_tensor, window_size=3)
+        else:
+            features = self.backbone(images.tensor, depth_tensor)   # 传入深度
+            for k, v in features.items():
+                assert torch.isfinite(v).all(), f"Feature {k} contains NaN/Inf"
+            outputs = self.sem_seg_head(features)
+
+            assert torch.isfinite(outputs['pred_masks']).all(), "pred_masks contains NaN/Inf"
+            assert torch.isfinite(outputs['pred_logits']).all(), "pred_logits contains NaN/Inf"
+            assert torch.isfinite(outputs['pred_embds']).all(), "pred_embds contains NaN/Inf"
+
+        if self.training:
+            # 训练逻辑与原 CTMinVIS 相同
+            targets = self.prepare_targets(batched_inputs, images)
+            outputs, targets = self.frame_decoder_loss_reshape(outputs, targets)
+
+            losses = self.criterion(outputs, targets)
+
+            for k in list(losses.keys()):
+                if k in self.criterion.weight_dict:
+                    losses[k] *= self.criterion.weight_dict[k]
+                else:
+                    losses.pop(k)
+
+            for k, v in losses.items():
+                assert torch.isfinite(v).all(), f"Loss {k} is NaN/Inf"
+
+            det_outputs, gt_instances = self.prepare_for_cl_plugin(outputs, targets)
+            losses.update(self.cl_plugin.train_loss(det_outputs, gt_instances, self.image_matcher))
+            return losses
+        else:
+            # 推理逻辑与原 CTMinVIS 相同
+            outputs = self.post_processing(outputs)
+            mask_cls_results = outputs["pred_logits"]
+            mask_pred_results = outputs["pred_masks"]
+
+            mask_cls_result = mask_cls_results[0]
+            mask_pred_result = mask_pred_results[0]
+            first_resize_size = (images.tensor.shape[-2], images.tensor.shape[-1])
+
+            input_per_image = batched_inputs[0]
+            image_size = images.image_sizes[0]
+            height = input_per_image.get("height", image_size[0])
+            width = input_per_image.get("width", image_size[1])
+
+            return retry_if_cuda_oom(self.inference_video)(
+                mask_cls_result,
+                mask_pred_result,
+                image_size,
+                height,
+                width,
+                first_resize_size)
+
+    def run_window_inference(self, images_tensor, depth_tensor, window_size=30):
+        iters = len(images_tensor) // window_size
+        if len(images_tensor) % window_size != 0:
+            iters += 1
+        out_list = []
+        for i in range(iters):
+            start_idx = i * window_size
+            end_idx = (i+1) * window_size
+
+            # 传入对应的深度切片
+            features = self.backbone(images_tensor[start_idx:end_idx], depth_tensor[start_idx:end_idx])
+            out = self.sem_seg_head(features)
+            del features['res2'], features['res3'], features['res4'], features['res5']
+            for j in range(len(out['aux_outputs'])):
+                del out['aux_outputs'][j]['pred_masks'], out['aux_outputs'][j]['pred_logits']
+            del out['mask_features']
+            out['pred_masks'] = out['pred_masks'].detach().cpu().to(torch.float32)
+            out_list.append(out)
+            del out
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        # 合并输出
+        outputs = {}
+        outputs['pred_logits'] = torch.cat([x['pred_logits'] for x in out_list], dim=1).to(torch.float32).detach().cpu()
+        outputs['pred_masks'] = torch.cat([x['pred_masks'] for x in out_list], dim=2)
+        outputs['pred_embds'] = torch.cat([x['pred_embds'] for x in out_list], dim=2).to(torch.float32).detach().cpu()
+        outputs['pred_reid_embed'] = torch.cat([x['pred_reid_embed'] for x in out_list], dim=2).to(torch.float32).detach().cpu()
+        return outputs

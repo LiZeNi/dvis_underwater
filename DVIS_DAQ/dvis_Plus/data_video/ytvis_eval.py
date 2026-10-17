@@ -445,26 +445,19 @@ def instances_to_coco_json_video(inputs, outputs):
     assert len(inputs) == 1, "More than one inputs are loaded for inference!"
 
     video_id = inputs[0]["video_id"]
-    video_length = inputs[0]["length"]
-
     scores = outputs["pred_scores"]
     labels = outputs["pred_labels"]
-    masks = outputs["pred_masks"]
+    
+    # 这里的 masks 已经是第一步处理好的极轻量的 RLE 列表了！
+    masks_rles = outputs["pred_masks"] 
 
     ytvis_results = []
-    for instance_id, (s, l, m) in enumerate(zip(scores, labels, masks)):
-        segms = [
-            mask_util.encode(np.array(_mask[:, :, None], order="F", dtype="uint8"))[0]
-            for _mask in m
-        ]
-        for rle in segms:
-            rle["counts"] = rle["counts"].decode("utf-8")
-
+    for s, l, rle_list in zip(scores, labels, masks_rles):
         res = {
             "video_id": video_id,
-            "score": s,
-            "category_id": l,
-            "segmentations": segms,
+            "score": float(s),       # 确保是标准浮点数
+            "category_id": int(l),   # 确保是标准整数
+            "segmentations": rle_list, # 直接赋值，没有任何显存占用！
         }
         ytvis_results.append(res)
 

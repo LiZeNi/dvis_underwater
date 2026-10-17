@@ -30,9 +30,6 @@ class MaskFormerHead(nn.Module):
             logger = logging.getLogger(__name__)
             for k in list(state_dict.keys()):
                 newk = k
-                # if "sem_seg_head" in k and not k.startswith(prefix + "predictor"):
-                #     newk = k.replace(prefix, prefix + "pixel_decoder.")
-                #     # logger.debug(f"{k} ==> {newk}")
                 if newk != k:
                     state_dict[newk] = state_dict[k]
                     del state_dict[k]
@@ -53,28 +50,15 @@ class MaskFormerHead(nn.Module):
         pixel_decoder: nn.Module,
         loss_weight: float = 1.0,
         ignore_value: int = -1,
-        return_transformer_feature: bool  = False,
-        # extra parameters
+        return_transformer_feature: bool = False,
         transformer_predictor: nn.Module,
         transformer_in_feature: str,
+        # 新增：解码器名称，用于判断是否需要传递额外参数
+        transformer_decoder_name: str = "MultiScaleMaskedTransformerDecoder",
     ):
-        """
-        NOTE: this interface is experimental.
-        Args:
-            input_shape: shapes (channels and stride) of the input features
-            num_classes: number of classes to predict
-            pixel_decoder: the pixel decoder module
-            loss_weight: loss weight
-            ignore_value: category id to be ignored during training.
-            transformer_predictor: the transformer decoder that makes prediction
-            transformer_in_feature: input feature name to the transformer_predictor
-        """
         super().__init__()
         input_shape = sorted(input_shape.items(), key=lambda x: x[1].stride)
         self.in_features = [k for k, v in input_shape]
-        feature_strides = [v.stride for k, v in input_shape]
-        feature_channels = [v.channels for k, v in input_shape]
-
         self.ignore_value = ignore_value
         self.common_stride = 4
         self.loss_weight = loss_weight
@@ -83,17 +67,27 @@ class MaskFormerHead(nn.Module):
         self.pixel_decoder = pixel_decoder
         self.predictor = transformer_predictor
         self.transformer_in_feature = transformer_in_feature
-
         self.num_classes = num_classes
+
+        # 判断是否使用需要额外参数的解码器
+        # 需要 track_masks 的解码器：VideoMultiScaleMaskedTransformerDecoder_dvisPlusAttnMask
+        self.use_track_masks = (
+            transformer_decoder_name == "VideoMultiScaleMaskedTransformerDecoder_dvisPlusAttnMask"
+        or transformer_decoder_name =="VideoMultiScaleMaskedTransformerDecoder_dvisPlusPositiveAttnMask")
+
+        self.use_query_prompts = (
+            transformer_decoder_name == "VideoMultiScaleMaskedTransformerDecoder_dvisPlusFeedback"
+        )
+
 
     @classmethod
     def from_config(cls, cfg, input_shape: Dict[str, ShapeSpec]):
-        # figure out in_channels to transformer predictor
+        # 计算 predictor 输入通道
         if cfg.MODEL.MASK_FORMER.TRANSFORMER_IN_FEATURE == "transformer_encoder":
             transformer_predictor_in_channels = cfg.MODEL.SEM_SEG_HEAD.CONVS_DIM
         elif cfg.MODEL.MASK_FORMER.TRANSFORMER_IN_FEATURE == "pixel_embedding":
             transformer_predictor_in_channels = cfg.MODEL.SEM_SEG_HEAD.MASK_DIM
-        elif cfg.MODEL.MASK_FORMER.TRANSFORMER_IN_FEATURE == "multi_scale_pixel_decoder":  # for maskformer2
+        elif cfg.MODEL.MASK_FORMER.TRANSFORMER_IN_FEATURE == "multi_scale_pixel_decoder":
             transformer_predictor_in_channels = cfg.MODEL.SEM_SEG_HEAD.CONVS_DIM
         else:
             transformer_predictor_in_channels = input_shape[cfg.MODEL.MASK_FORMER.TRANSFORMER_IN_FEATURE].channels
@@ -113,37 +107,79 @@ class MaskFormerHead(nn.Module):
                 transformer_predictor_in_channels,
                 mask_classification=True,
             ),
+            "transformer_decoder_name": cfg.MODEL.MASK_FORMER.TRANSFORMER_DECODER_NAME,  # 关键新增
         }
 
-    def forward(self, features, mask=None, clip_size=None):
-        return self.layers(features, mask, clip_size=clip_size)
+    def forward(self, features, mask=None, clip_size=None, query_prompts=None, query_embed_prompts=None, track_masks=None):
+        return self.layers(
+            features, mask,
+            clip_size=clip_size,
+            query_prompts=query_prompts,
+            query_embed_prompts=query_embed_prompts,
+            track_masks=track_masks,
+        )
 
-    def layers(self, features, mask=None, clip_size=None):
+    def layers(self, features, mask=None, clip_size=None, query_prompts=None, query_embed_prompts=None, track_masks=None):
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(features)
+
+        # 构建传递给 predictor 的参数字典，根据标志包含可选参数
+        extra_args = {}
+        if self.use_track_masks:
+            extra_args["track_masks"] = track_masks
+        if self.use_query_prompts:
+            extra_args["query_prompts"] = query_prompts
+            extra_args["query_embed_prompts"] = query_embed_prompts
+
         if self.transformer_in_feature == "multi_scale_pixel_decoder":
             if clip_size is not None:
-                predictions = self.predictor(multi_scale_features, mask_features, mask, clip_size=clip_size)
+                predictions = self.predictor(
+                    multi_scale_features, mask_features, mask,
+                    clip_size=clip_size,
+                    **extra_args,
+                )
             else:
-                predictions = self.predictor(multi_scale_features, mask_features, mask)
+                predictions = self.predictor(
+                    multi_scale_features, mask_features, mask,
+                    **extra_args,
+                )
+        elif self.transformer_in_feature == "transformer_encoder":
+            assert transformer_encoder_features is not None, "Please use the TransformerEncoderPixelDecoder."
+            if clip_size is not None:
+                predictions = self.predictor(
+                    transformer_encoder_features, mask_features, mask,
+                    clip_size=clip_size,
+                    **extra_args,
+                )
+            else:
+                predictions = self.predictor(
+                    transformer_encoder_features, mask_features, mask,
+                    **extra_args,
+                )
+        elif self.transformer_in_feature == "pixel_embedding":
+            if clip_size is not None:
+                predictions = self.predictor(
+                    mask_features, mask_features, mask,
+                    clip_size=clip_size,
+                    **extra_args,
+                )
+            else:
+                predictions = self.predictor(
+                    mask_features, mask_features, mask,
+                    **extra_args,
+                )
         else:
-            if self.transformer_in_feature == "transformer_encoder":
-                assert (
-                    transformer_encoder_features is not None
-                ), "Please use the TransformerEncoderPixelDecoder."
-                if clip_size is not None:
-                    predictions = self.predictor(transformer_encoder_features, mask_features, mask, clip_size=clip_size)
-                else:
-                    predictions = self.predictor(transformer_encoder_features, mask_features, mask)
-            elif self.transformer_in_feature == "pixel_embedding":
-                if clip_size is not None:
-                    predictions = self.predictor(mask_features, mask_features, mask, clip_size=clip_size)
-                else:
-                    predictions = self.predictor(mask_features, mask_features, mask)
+            if clip_size is not None:
+                predictions = self.predictor(
+                    features[self.transformer_in_feature], mask_features, mask,
+                    clip_size=clip_size,
+                    **extra_args,
+                )
             else:
-                if clip_size is not None:
-                    predictions = self.predictor(features[self.transformer_in_feature], mask_features, mask)
-                else:
-                    predictions = self.predictor(features[self.transformer_in_feature], mask_features, mask)
+                predictions = self.predictor(
+                    features[self.transformer_in_feature], mask_features, mask,
+                    **extra_args,
+                )
+
         if self.return_transformer_feature:
             if transformer_encoder_features is not None:
                 predictions['transformer_features'] = transformer_encoder_features

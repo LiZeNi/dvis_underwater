@@ -1,0 +1,32 @@
+_BASE_: /data/zlni/zlni/DVIS_Plus/DVIS_Plus/configs/dvis_Plus/ovis/CTVIS_R50_fishtrack.yaml
+MODEL:
+  BACKBONE:
+    NAME: "D2DepthVitAdapterDinoV2"
+  VIT_ADAPTER:
+    FINETUNE: False
+    NAME: 'vitb'
+    VIT_WEIGHT: '/data/zlni/zlni/data/DINIOv2/dinov2_vitb14_pretrain.pth'
+    FREEZE_VIT: True
+    FUSION_TYPE: "cmx"      # 深度融合方式
+    DEPTH_IN_CHANNELS: 1
+  PIXEL_MEAN: [123.675, 116.280, 103.530]
+  PIXEL_STD: [58.395, 57.120, 57.375]
+  MASK_FORMER:
+    NUM_OBJECT_QUERIES: 200
+  CL_PLUGIN:
+    NUM_NEGATIVES: 199
+SOLVER:
+  IMS_PER_BATCH: 16
+  STEPS: (6000, 12000)
+  MAX_ITER: 16000
+
+INPUT:
+  SAMPLING_FRAME_NUM: 5 #11
+  SAMPLING_FRAME_RANGE: 8 #5
+  USE_DEPTH: True   # 启用深度输入，让 dataloader 使用 DepthYTVISDatasetMapper
+
+DATASETS:
+  TRAIN: ["fishtrack_ytvis_depth_train"]   
+  TEST: ["fishtrack_ytvis_depth_val"] 
+
+OUTPUT_DIR: '/data/zlni/zlni/data/UMOT_weight/research/depth/cmx/CTVIS_DIONv2B'
